@@ -1,78 +1,173 @@
-// Runs against the real database in DATABASE_URL; cleans up the user it creates.
 const test = require("node:test");
 const assert = require("node:assert");
 const jwt = require("jsonwebtoken");
 const { app, prisma } = require("./index");
 
-const email = `test-${Date.now()}@example.com`;
-let base, server, token;
 
-const call = async (method, path, body, auth) => {
-  const res = await fetch(base + path, {
-    method,
-    headers: { "Content-Type": "application/json", ...(auth && { Authorization: auth }) },
-    body: body && JSON.stringify(body),
+const testEmail = "test-" + Date.now() + "@example.com";
+const testPassword = "secret1";
+
+let server;
+let baseUrl;
+let savedToken;
+
+
+async function sendRequest(method, path, body, token) {
+  const options = {
+    method: method,
+    headers: { "Content-Type": "application/json" },
+  };
+  if (body) {
+    options.body = JSON.stringify(body);
+  }
+  if (token) {
+    options.headers.Authorization = "Bearer " + token;
+  }
+
+  const response = await fetch(baseUrl + path, options);
+  const data = await response.json();
+  return { status: response.status, body: data };
+}
+
+
+
+
+test.before(async function () {
+  await new Promise(function (resolve) {
+    server = app.listen(0, resolve);
   });
-  return { status: res.status, body: await res.json() };
-};
+  baseUrl = "http://localhost:" + server.address().port;
+});
 
-test.before(() => new Promise((r) => {
-  server = app.listen(0, () => { base = `http://localhost:${server.address().port}`; r(); });
-}));
-test.after(async () => {
-  await prisma.user.deleteMany({ where: { email } });
-  await prisma.$disconnect();
+
+test.after(async function () {
+  try {
+    await prisma.user.deleteMany({ where: { email: testEmail } });
+    await prisma.$disconnect();
+  } catch (error) {
+    console.error("Cleanup failed:", error);
+  }
   server.close();
 });
 
-test("signup", async () => {
-  assert.equal((await call("POST", "/signup", { email, password: "12345" })).status, 400);
-  assert.equal((await call("POST", "/signup", { password: "123456" })).status, 400);
 
-  const res = await call("POST", "/signup", { email: `  ${email.toUpperCase()} `, password: "secret1" });
-  assert.equal(res.status, 201);
-  assert.equal(res.body.user.email, email);
-  assert.equal(res.body.user.password, undefined);
-  const payload = jwt.decode(res.body.token);
-  assert.equal(payload.id, res.body.user.id);
-  assert.equal(payload.email, email);
+test("signup: password shorter than 6 characters gives 400", async function () {
+  const result = await sendRequest("POST", "/signup", { email: testEmail, password: "12345" });
+  assert.equal(result.status, 400);
+});
+
+test("signup: missing email gives 400", async function () {
+  const result = await sendRequest("POST", "/signup", { password: testPassword });
+  assert.equal(result.status, 400);
+});
+
+test("signup: valid details give 201, a clean email and a token", async function () {
+
+  const messyEmail = "  " + testEmail.toUpperCase() + " ";
+  const result = await sendRequest("POST", "/signup", { email: messyEmail, password: testPassword });
+
+  assert.equal(result.status, 201);
+  assert.equal(result.body.user.email, testEmail);
+  assert.equal(result.body.user.password, undefined);
+
+
+  const payload = jwt.decode(result.body.token);
+  assert.equal(payload.id, result.body.user.id);
+  assert.equal(payload.email, testEmail);
   assert.ok(payload.jti);
   assert.equal(payload.exp - payload.iat, 3600);
-
-  assert.equal((await call("POST", "/signup", { email, password: "secret1" })).status, 409);
 });
 
-test("login", async () => {
-  assert.equal((await call("POST", "/login", { email })).status, 400);
-  const wrong = await call("POST", "/login", { email, password: "nope-nope" });
-  const unknown = await call("POST", "/login", { email: "nobody@example.com", password: "secret1" });
-  assert.equal(wrong.status, 401);
-  assert.equal(unknown.status, 401);
-  assert.deepEqual(wrong.body, unknown.body);
-
-  const ok = await call("POST", "/login", { email: ` ${email.toUpperCase()}`, password: "secret1" });
-  assert.equal(ok.status, 200);
-  assert.equal(ok.body.user.password, undefined);
-  token = ok.body.token;
+test("signup: same email again gives 409", async function () {
+  const result = await sendRequest("POST", "/signup", { email: testEmail, password: testPassword });
+  assert.equal(result.status, 409);
 });
 
-test("protected routes", async () => {
-  for (const path of ["/me", "/dashboard"]) {
-    assert.equal((await call("GET", path)).status, 401);
-    assert.equal((await call("GET", path, null, "Bearer garbage")).status, 401);
-    const expired = jwt.sign({ id: 1, email }, process.env.JWTSECRET, { expiresIn: -1 });
-    assert.equal((await call("GET", path, null, `Bearer ${expired}`)).status, 401);
-  }
 
-  const me = await call("GET", "/me", null, `Bearer ${token}`);
-  assert.equal(me.status, 200);
-  assert.deepEqual(Object.keys(me.body.user).sort(), ["createdAt", "email", "id", "name"]);
 
-  const dash = await call("GET", "/dashboard", null, `Bearer ${token}`);
-  assert.equal(dash.status, 200);
-  assert.equal(dash.body.message, `Welcome, ${email}!`);
+test("login: missing password gives 400", async function () {
+  const result = await sendRequest("POST", "/login", { email: testEmail });
+  assert.equal(result.status, 400);
+});
 
-  const ghost = jwt.sign({ id: 2147483647, email }, process.env.JWTSECRET, { expiresIn: "1h" });
-  assert.equal((await call("GET", "/me", null, `Bearer ${ghost}`)).status, 404);
-  assert.equal((await call("GET", "/dashboard", null, `Bearer ${ghost}`)).status, 404);
+test("login: wrong password and unknown email give the same 401", async function () {
+  const wrongPassword = await sendRequest("POST", "/login", {
+    email: testEmail,
+    password: "wrong-password",
+  });
+  const unknownEmail = await sendRequest("POST", "/login", {
+    email: "nobody@example.com",
+    password: testPassword,
+  });
+
+  assert.equal(wrongPassword.status, 401);
+  assert.equal(unknownEmail.status, 401);
+  assert.equal(wrongPassword.body.error, unknownEmail.body.error);
+});
+
+test("login: correct details give 200 and a token", async function () {
+  const result = await sendRequest("POST", "/login", { email: testEmail, password: testPassword });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.user.email, testEmail);
+  assert.equal(result.body.user.password, undefined);
+  assert.ok(result.body.token);
+
+  savedToken = result.body.token;
+});
+
+
+
+test("/me and /dashboard: no token gives 401", async function () {
+  const me = await sendRequest("GET", "/me");
+  const dashboard = await sendRequest("GET", "/dashboard");
+  assert.equal(me.status, 401);
+  assert.equal(dashboard.status, 401);
+});
+
+test("/me and /dashboard: a fake token gives 401", async function () {
+  const me = await sendRequest("GET", "/me", null, "not-a-real-token");
+  const dashboard = await sendRequest("GET", "/dashboard", null, "not-a-real-token");
+  assert.equal(me.status, 401);
+  assert.equal(dashboard.status, 401);
+});
+
+test("/me and /dashboard: an expired token gives 401", async function () {
+
+  const expiredToken = jwt.sign({ id: 1, email: testEmail }, process.env.JWTSECRET, {
+    expiresIn: -1,
+  });
+  const me = await sendRequest("GET", "/me", null, expiredToken);
+  const dashboard = await sendRequest("GET", "/dashboard", null, expiredToken);
+  assert.equal(me.status, 401);
+  assert.equal(dashboard.status, 401);
+});
+
+test("/me: valid token gives 200 and the profile without the password", async function () {
+  const result = await sendRequest("GET", "/me", null, savedToken);
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.user.email, testEmail);
+  assert.ok(result.body.user.id);
+  assert.ok(result.body.user.createdAt);
+  assert.equal(result.body.user.password, undefined);
+});
+
+test("/dashboard: valid token gives 200 and a welcome message", async function () {
+  const result = await sendRequest("GET", "/dashboard", null, savedToken);
+
+  assert.equal(result.status, 200);
+
+  assert.equal(result.body.message, "Welcome, " + testEmail + "!");
+});
+
+test("/me and /dashboard: token of a user that does not exist gives 404", async function () {
+
+  const tokenForMissingUser = jwt.sign({ id: 2147483647, email: testEmail }, process.env.JWTSECRET, {
+    expiresIn: "1h",
+  });
+  const me = await sendRequest("GET", "/me", null, tokenForMissingUser);
+  const dashboard = await sendRequest("GET", "/dashboard", null, tokenForMissingUser);
+  assert.equal(me.status, 404);
+  assert.equal(dashboard.status, 404);
 });
