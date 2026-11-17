@@ -1,3 +1,7 @@
 node_modules/
 .env
-
+# agent tooling added by `prisma init`
+.agents/
+.claude/
+.windsurf/
+skills-lock.json
